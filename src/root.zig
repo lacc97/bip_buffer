@@ -7,7 +7,15 @@ pub const Options = struct {
     single_threaded: bool = true,
 };
 
-fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
+fn BipBufferReservation(comptime T: type) type {
+    return struct {
+        data: []T,
+        curr_head: usize,
+        head: usize,
+    };
+}
+
+pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
     const load = struct {
         inline fn load(p: *const usize) usize {
             var v: usize = undefined;
@@ -37,11 +45,7 @@ fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
         head: usize,
         tail: usize,
 
-        pub const Reservation = struct {
-            data: []T,
-            curr_head: usize,
-            head: usize,
-        };
+        pub const Reservation = BipBufferReservation(T);
 
         pub fn init(buf: []T) Buffer {
             if (!(buf.len > 0)) @panic("empty buffer");
