@@ -1,7 +1,12 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const assert = std.debug.assert;
 
-fn BipBufferUnmanaged(comptime T: type) type {
+pub const Options = struct {
+    safety_checks: bool = (builtin.mode == .Debug or builtin.mode == .ReleaseSafe),
+};
+
+fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
     return struct {
         const Buffer = @This();
 
@@ -14,7 +19,6 @@ fn BipBufferUnmanaged(comptime T: type) type {
             data: []T,
             head: usize,
             next_head: usize,
-            next_mark: usize,
         };
 
         pub fn init(buf: []T) Buffer {
@@ -31,42 +35,46 @@ fn BipBufferUnmanaged(comptime T: type) type {
             b.* = init(buf);
         }
 
-        pub noinline fn reserve(b: *Buffer, count: usize) error{OutOfMemory}!Reservation {
-            assert(count > 0); // Bad reserve count.
+        pub fn reserve(b: *Buffer, count: usize) error{OutOfMemory}!Reservation {
+            if (comptime opts.safety_checks) if (!(count > 0)) @panic("bad reserve count");
 
             const head = b.head;
             const tail = b.tail;
 
-            const available_regions = availableRegions(b.data, head, tail);
+            const available_regions = availableWriteRegions(b.data, head, tail);
             if (available_regions[0].len >= count) return .{
-                .data = available_regions[0][0..count],
+                .data = available_regions[0][head..][0..count],
                 .head = head,
                 .next_head = head,
-                .next_mark = if (tail <= head) b.data.len else b.mark,
             };
             if (available_regions[1].len >= count) return .{
                 .data = available_regions[1][0..count],
                 .head = head,
                 .next_head = 0,
-                .next_mark = if (tail <= head) b.data.len else b.mark,
             };
 
             return error.OutOfMemory;
         }
 
         pub fn commit(b: *Buffer, r: Reservation, count: usize) void {
-            assert(count <= r.data.len); // Bad commit count.
+            if (comptime opts.safety_checks) if (!(r.data.len < b.data.len)) @panic("bad reservation");
+            if (comptime opts.safety_checks) if (!(r.head < b.data.len)) @panic("bad reservation");
+            if (comptime opts.safety_checks) if (!(r.next_head < b.data.len)) @panic("bad reservation");
+            if (comptime opts.safety_checks) if (!(count <= r.data.len)) @panic("bad commit count");
 
             const head = b.head;
-            _ = head; // autofix
             const tail = b.tail;
-            _ = tail; // autofix
 
-            b.mark = r.next_mark;
+            if (comptime opts.safety_checks) if (!(r.head == head)) @panic("already committed this reservation");
+
+            const available_regions = availableWriteRegions(b.data, head, tail);
+            if (comptime opts.safety_checks) if (!(count <= available_regions[0].len or count <= available_regions[1].len)) @panic("bad reservation");
+
+            b.mark = if ((b.data.len - head) >= r.data.len) (r.next_head + count) else (r.next_head);
             b.head = r.next_head + count;
         }
 
-        inline fn availableRegions(data: []T, head: usize, tail: usize) [2][]T {
+        inline fn availableWriteRegions(data: []T, head: usize, tail: usize) [2][]T {
             const available_0 = blk: {
                 const end = if (tail <= head) (data.len) else (tail - 1);
                 break :blk end - head;
@@ -88,7 +96,7 @@ test {
     const storage = try testing.allocator.alloc(u8, 1024);
     defer testing.allocator.free(storage);
 
-    var b = BipBufferUnmanaged(u8).init(storage);
+    var b = BipBufferUnmanaged(u8, .{}).init(storage);
 
     const r = try b.reserve(16);
     b.commit(r, 17);
