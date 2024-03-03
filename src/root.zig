@@ -17,8 +17,8 @@ fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
 
         pub const Reservation = struct {
             data: []T,
+            curr_head: usize,
             head: usize,
-            next_head: usize,
         };
 
         pub fn init(buf: []T) Buffer {
@@ -41,16 +41,22 @@ fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
             const head = b.head;
             const tail = b.tail;
 
-            const available_regions = availableWriteRegions(b.data, head, tail);
-            if (available_regions[0].len >= count) return .{
-                .data = available_regions[0][head..][0..count],
-                .head = head,
-                .next_head = head,
+            // This is the region that immediately follows after the current value of head. It is limited by either tail or the end of the buffer.
+            const end_0 = if (tail <= head) (b.data.len) else (tail - 1);
+            const beg_0 = head;
+            if ((end_0 - beg_0) >= count) return .{
+                .data = b.data[beg_0..][0..count],
+                .curr_head = head,
+                .head = beg_0,
             };
-            if (available_regions[1].len >= count) return .{
-                .data = available_regions[1][0..count],
-                .head = head,
-                .next_head = 0,
+
+            // This is the second region after wraparound of head, which can only happen if head is in front of tail.
+            const end_1 = if (tail > 0) (tail - 1) else 0;
+            const beg_1 = if (tail <= head) 0 else end_1;
+            if ((end_1 - beg_1) >= count) return .{
+                .data = b.data[beg_1..][0..count],
+                .curr_head = head,
+                .head = beg_1,
             };
 
             return error.OutOfMemory;
@@ -58,34 +64,25 @@ fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
 
         pub fn commit(b: *Buffer, r: Reservation, count: usize) void {
             if (comptime opts.safety_checks) if (!(r.data.len < b.data.len)) @panic("bad reservation");
+            if (comptime opts.safety_checks) if (!(r.curr_head < b.data.len)) @panic("bad reservation");
             if (comptime opts.safety_checks) if (!(r.head < b.data.len)) @panic("bad reservation");
-            if (comptime opts.safety_checks) if (!(r.next_head < b.data.len)) @panic("bad reservation");
             if (comptime opts.safety_checks) if (!(count <= r.data.len)) @panic("bad commit count");
 
+            const mark = b.mark;
             const head = b.head;
+
+            if (comptime opts.safety_checks) if (!(r.curr_head == head)) @panic("already committed this reservation");
+
+            const next_head = r.head + count;
             const tail = b.tail;
 
-            if (comptime opts.safety_checks) if (!(r.head == head)) @panic("already committed this reservation");
+            const next_mark = if (tail <= head) (next_head) else @max(mark, r.curr_head);
 
-            const available_regions = availableWriteRegions(b.data, head, tail);
-            if (comptime opts.safety_checks) if (!(count <= available_regions[0].len or count <= available_regions[1].len)) @panic("bad reservation");
+            if (comptime opts.safety_checks) if (!(next_head < b.data.len)) @panic("BUG: inconsistent head value");
+            if (comptime opts.safety_checks) if (!(next_mark >= b.tail)) @panic("BUG: inconsistent mark value");
 
-            b.mark = if ((b.data.len - head) >= r.data.len) (r.next_head + count) else (r.next_head);
-            b.head = r.next_head + count;
-        }
-
-        inline fn availableWriteRegions(data: []T, head: usize, tail: usize) [2][]T {
-            const available_0 = blk: {
-                const end = if (tail <= head) (data.len) else (tail - 1);
-                break :blk end - head;
-            };
-            const available_1 = blk: {
-                const end = if (tail > 0) (tail - 1) else 0;
-                const beg = if (tail <= head) 0 else end;
-                break :blk end - beg;
-            };
-
-            return .{ data[head..][0..available_0], data[0..available_1] };
+            b.mark = next_mark;
+            b.head = next_head;
         }
     };
 }
@@ -99,5 +96,8 @@ test {
     var b = BipBufferUnmanaged(u8, .{}).init(storage);
 
     const r = try b.reserve(16);
-    b.commit(r, 17);
+    @memcpy(r.data[0..5], "Hello");
+    b.commit(r, 16);
+
+    try testing.expectEqualStrings("Hello", b.data[0..5]);
 }
