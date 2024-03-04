@@ -7,36 +7,7 @@ pub const Options = struct {
     single_threaded: bool = true,
 };
 
-fn BipBufferReservation(comptime T: type) type {
-    return struct {
-        data: []T,
-        curr_head: usize,
-        head: usize,
-    };
-}
-
 pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
-    const load = struct {
-        inline fn load(p: *const usize) usize {
-            var v: usize = undefined;
-            if (comptime opts.single_threaded) {
-                v = p.*;
-            } else {
-                v = @atomicLoad(usize, p, .Acquire);
-            }
-            return v;
-        }
-    }.load;
-    const store = struct {
-        inline fn store(p: *usize, v: usize) void {
-            if (comptime opts.single_threaded) {
-                p.* = v;
-            } else {
-                @atomicStore(usize, p, v, .Release);
-            }
-        }
-    }.store;
-
     return struct {
         const Buffer = @This();
 
@@ -44,8 +15,6 @@ pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
         mark: usize,
         head: usize,
         tail: usize,
-
-        pub const Reservation = BipBufferReservation(T);
 
         pub fn init(buf: []T) Buffer {
             if (!(buf.len > 0)) @panic("empty buffer");
@@ -63,130 +32,167 @@ pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
             b.* = init(buf);
         }
 
-        pub fn totalAvailableForWrite(b: *const Buffer) usize {
-            const head = load(&b.head);
-            if (comptime opts.safety_checks) if (!(head < b.data.len)) @panic("BUG: inconsistent head value");
-            const tail = load(&b.tail);
-            if (comptime opts.safety_checks) if (!(tail < b.data.len)) @panic("BUG: inconsistent tail value");
-
-            // This is the region that immediately follows after the current value of head, limited by either tail or the end of the buffer.
-            const end_0 = if (tail <= head) (b.data.len - 1) else (tail - 1);
-            const beg_0 = head;
-
-            // This is the second region after wraparound of head, which can only happen if head is in front of tail.
-            const end_1 = if (tail > 0) (tail) else 0;
-            const beg_1 = if (tail <= head) 0 else end_1;
-
-            return (end_0 - beg_0) + (end_1 - beg_1);
+        pub fn reserveExact(b: *Buffer, count: usize) ?Reserve {
+            const r = b.reserveLargest(count);
+            return if (r.data.len == count) r else null;
         }
 
-        pub fn totalAvailableForRead(b: *const Buffer) usize {
-            const mark = load(&b.mark);
-            if (comptime opts.safety_checks) if (!(mark < b.data.len)) @panic("BUG: inconsistent mark value");
+        pub fn reserveLargest(b: *Buffer, count: usize) Reserve {
             const head = load(&b.head);
-            if (comptime opts.safety_checks) if (!(head < b.data.len)) @panic("BUG: inconsistent head value");
+            check(head < b.data.len, "BUG: inconsistent head pointer value");
+
             const tail = load(&b.tail);
-            if (comptime opts.safety_checks) if (!(tail < b.data.len)) @panic("BUG: inconsistent tail value");
+            check(tail < b.data.len, "BUG: inconsistent tail pointer value");
 
-            // This is the region that immediately follows after the current value of tail, limited by head or mark.
-            const end_0 = if (tail <= head) (head) else (mark);
-            const beg_0 = tail;
+            if (head < tail) {
+                const mark = load(&b.mark);
+                check(mark <= b.data.len, "BUG: inconsistent mark pointer value");
+                check(head <= mark, "BUG: inconsistent mark and head pointer value");
 
-            // This is the second region after wraparound of tail, which can only happen if tail is in front of head.
-            const end_1 = if (tail <= head) (0) else (head);
-            const beg_1 = if (tail <= head) (end_1) else (0);
-
-            return (end_0 - beg_0) + (end_1 - beg_1);
+                const len = @min(count, tail - head - 1);
+                return .{
+                    .data = b.data[head..][0..len],
+                    .__bb = b,
+                    .__head = head,
+                    .__mark = mark,
+                    .__mark_shift = false,
+                };
+            } else {
+                const end = if (tail != 0) (b.data.len) else (b.data.len - 1);
+                if ((end - head) >= count) {
+                    return .{
+                        .data = b.data[head..][0..count],
+                        .__bb = b,
+                        .__head = head,
+                        .__mark = head,
+                        .__mark_shift = true,
+                    };
+                } else {
+                    // Wrap around.
+                    const len = if (tail > 0) @min(count, tail - 1) else 0;
+                    return .{
+                        .data = b.data[0..][0..len],
+                        .__bb = b,
+                        .__head = 0,
+                        .__mark = head,
+                        .__mark_shift = false,
+                    };
+                }
+            }
         }
 
-        pub fn reserve(b: *Buffer, count: usize) error{OutOfMemory}!Reservation {
-            if (comptime opts.safety_checks) if (!(count > 0)) @panic("bad reserve count");
+        pub const Reserve = struct {
+            data: []T,
 
+            __bb: *Buffer,
+
+            /// Copy of the head pointer at the time of reserve.
+            __head: usize,
+
+            /// The next base value for the mark pointer.
+            __mark: usize,
+
+            /// Whether we need to shift the mark pointer at commit.
+            __mark_shift: bool,
+
+            pub fn commit(r: Reserve, count: usize) void {
+                check(count <= r.data.len, "bad commit count");
+
+                if (count == 0) return;
+
+                const next_mark = r.__mark + if (r.__mark_shift) (count) else (0);
+                const next_head = blk: {
+                    var next = r.__head + count;
+                    if (next == r.__bb.data.len) next = 0;
+                    break :blk next;
+                };
+
+                check(next_head < r.__bb.data.len, "BUG: inconsistent head pointer value");
+                check(next_mark <= r.__bb.data.len, "BUG: inconsistent mark pointer value");
+                check(next_head <= next_mark, "BUG: inconsistent mark and head pointer value");
+                store(&r.__bb.mark, next_mark);
+                store(&r.__bb.head, next_head);
+            }
+        };
+
+        pub fn peek(b: *Buffer) Peek {
             const head = load(&b.head);
-            if (comptime opts.safety_checks) if (!(head < b.data.len)) @panic("BUG: inconsistent head value");
+            check(head < b.data.len, "BUG: inconsistent head pointer value");
+
             const tail = load(&b.tail);
-            if (comptime opts.safety_checks) if (!(tail < b.data.len)) @panic("BUG: inconsistent tail value");
+            check(tail < b.data.len, "BUG: inconsistent tail pointer value");
 
-            // This is the region that immediately follows after the current value of head. It is limited by either tail or the end of the buffer.
-            const end_0 = if (tail <= head) (b.data.len - 1) else (tail - 1);
-            const beg_0 = head;
-            if ((end_0 - beg_0) >= count) return .{
-                .data = b.data[beg_0..][0..count],
-                .curr_head = head,
-                .head = beg_0,
-            };
+            if (head >= tail) {
+                return .{
+                    .data = b.data[tail..head],
+                    .__bb = b,
+                    .__tail = tail,
+                    .__wrap = false,
+                };
+            } else {
+                const mark = load(&b.mark);
+                check(mark <= b.data.len, "BUG: inconsistent mark pointer value");
+                check(head <= mark, "BUG: inconsistent mark and head pointer value");
 
-            // This is the second region after wraparound of head, which can only happen if head is in front of tail.
-            const end_1 = if (tail > 0) (tail - 1) else 0;
-            const beg_1 = if (tail <= head) 0 else end_1;
-            if ((end_1 - beg_1) >= count) return .{
-                .data = b.data[beg_1..][0..count],
-                .curr_head = head,
-                .head = beg_1,
-            };
+                return if (tail == mark) .{
+                    .data = b.data[0..head],
+                    .__bb = b,
+                    .__tail = 0,
+                    .__wrap = false,
+                } else .{
+                    .data = b.data[tail..mark],
+                    .__bb = b,
+                    .__tail = tail,
+                    .__wrap = true,
+                };
+            }
+        }
+        pub const Peek = struct {
+            data: []T,
 
-            return error.OutOfMemory;
+            __bb: *Buffer,
+
+            // Copy of the tail pointer at the time of peeking.
+            __tail: usize,
+
+            // Whether a full consume will trigger wrapping on the tail pointer.
+            __wrap: bool,
+
+            pub fn consume(p: Peek, count: usize) void {
+                check(count <= p.data.len, "bad consume count");
+
+                if (count == 0) return;
+
+                const next_tail = blk: {
+                    var next = p.__tail + count;
+                    if (p.__wrap and count == p.data.len) next = 0;
+                    break :blk next;
+                };
+                check(next_tail < p.__bb.data.len, "BUG: inconsistent tail pointer value");
+                store(&p.__bb.tail, next_tail);
+            }
+        };
+
+        inline fn check(b: bool, comptime msg: []const u8) void {
+            if (comptime opts.safety_checks) if (!b) @panic(msg);
         }
 
-        pub fn commit(b: *Buffer, r: Reservation, count: usize) void {
-            if (count == 0) return;
-
-            const mark = load(&b.mark);
-            if (comptime opts.safety_checks) if (!(mark < b.data.len)) @panic("BUG: inconsistent mark value");
-            const head = load(&b.head);
-            if (comptime opts.safety_checks) if (!(head < b.data.len)) @panic("BUG: inconsistent head value");
-
-            if (comptime opts.safety_checks) if (!(r.data.len < b.data.len)) @panic("bad reservation");
-            if (comptime opts.safety_checks) if (!(r.curr_head < b.data.len)) @panic("bad reservation");
-            if (comptime opts.safety_checks) if (!(r.head < b.data.len)) @panic("bad reservation");
-            if (comptime opts.safety_checks) if (!(count <= r.data.len)) @panic("bad commit count");
-
-            if (comptime opts.safety_checks) if (!(r.curr_head == head)) @panic("already committed this reservation");
-
-            const next_head = r.head + count;
-            if (comptime opts.safety_checks) if (!(next_head < b.data.len)) @panic("BUG: inconsistent head value");
-
-            const tail = load(&b.tail);
-            if (comptime opts.safety_checks) if (!(tail < b.data.len)) @panic("BUG: inconsistent tail value");
-
-            // Set mark when wraparound, otherwise keep up with head.
-            const next_mark = if (next_head <= head) (head) else @max(mark, next_head);
-            if (comptime opts.safety_checks) if (!(next_mark >= tail)) @panic("BUG: inconsistent mark value");
-
-            store(&b.mark, next_mark);
-            store(&b.head, next_head);
+        inline fn load(p: *const usize) usize {
+            var v: usize = undefined;
+            if (comptime opts.single_threaded) {
+                v = p.*;
+            } else {
+                v = @atomicLoad(usize, p, .Acquire);
+            }
+            return v;
         }
 
-        pub fn peek(b: *const Buffer) []const u8 {
-            const mark = load(&b.mark);
-            if (comptime opts.safety_checks) if (!(mark < b.data.len)) @panic("BUG: inconsistent mark value");
-            const head = load(&b.head);
-            if (comptime opts.safety_checks) if (!(head < b.data.len)) @panic("BUG: inconsistent head value");
-            const tail = load(&b.tail);
-            if (comptime opts.safety_checks) if (!(tail < b.data.len)) @panic("BUG: inconsistent tail value");
-
-            const end = if (tail <= head) (head) else (mark);
-            return b.data[tail..end];
-        }
-
-        pub fn consume(b: *Buffer, count: usize) void {
-            if (count == 0) return;
-
-            const mark = load(&b.mark);
-            if (comptime opts.safety_checks) if (!(mark < b.data.len)) @panic("BUG: inconsistent mark value");
-            const head = load(&b.head);
-            if (comptime opts.safety_checks) if (!(head < b.data.len)) @panic("BUG: inconsistent head value");
-            const tail = load(&b.tail);
-            if (comptime opts.safety_checks) if (!(tail < b.data.len)) @panic("BUG: inconsistent tail value");
-
-            const end = if (tail <= head) (head) else (mark);
-            if (comptime opts.safety_checks) if (!((end - tail) >= count)) @panic("bad consume count");
-
-            // Wrap around only in the case where we are in front of head and we have reached the mark.
-            const next_tail = if (tail <= head or count < (end - tail)) (tail + count) else 0;
-            if (comptime opts.safety_checks) if (!(next_tail < b.data.len)) @panic("BUG: inconsistent tail value");
-
-            store(&b.tail, next_tail);
+        inline fn store(p: *usize, v: usize) void {
+            if (comptime opts.single_threaded) {
+                p.* = v;
+            } else {
+                @atomicStore(usize, p, v, .Release);
+            }
         }
     };
 }
@@ -204,59 +210,42 @@ test {
         defer testing.allocator.free(storage);
 
         var b = B.init(storage);
-        try testing.expectEqual(@as(usize, 16), b.totalAvailableForWrite());
-        try testing.expectEqual(@as(usize, 0), b.totalAvailableForRead());
 
         {
-            const r = try b.reserve(16);
+            const r = b.reserveExact(16) orelse return error.OutOfSpace;
             @memcpy(r.data[0..5], "Hello");
-            b.commit(r, 5);
-            try testing.expectEqual(@as(usize, 11), b.totalAvailableForWrite());
-            try testing.expectEqual(@as(usize, 5), b.totalAvailableForRead());
+            r.commit(5);
 
             const peeked = b.peek();
-            try testing.expectEqualStrings("Hello", peeked);
-            b.consume(5);
+            try testing.expectEqualStrings("Hello", peeked.data);
+            peeked.consume(5);
         }
 
-        try testing.expectEqual(@as(usize, 16), b.totalAvailableForWrite());
-        try testing.expectEqual(@as(usize, 0), b.totalAvailableForRead());
-
         {
-            try testing.expectError(error.OutOfMemory, b.reserve(16));
-            const r0 = try b.reserve(11);
-            @memcpy(r0.data[0..8], ", World!");
-            b.commit(r0, 8);
-            try testing.expectEqual(@as(usize, 8), b.totalAvailableForWrite());
-            try testing.expectEqual(@as(usize, 8), b.totalAvailableForRead());
+            try testing.expectEqual(@as(?B.Reserve, null), b.reserveExact(16));
+            const r0 = b.reserveExact(11) orelse return error.OutOfSpace;
+            @memcpy(r0.data[0..9], ", World!!");
+            r0.commit(9);
 
-            // This one will leave a mark at 13 because there is only 3 spaces left at the end of the ring.
-            const r1 = try b.reserve(4);
+            // This one will leave a mark at 14 because there is only 3 spaces left at the end of the ring.
+            const r1 = b.reserveExact(4) orelse return error.OutOfSpace;
             @memcpy(r1.data[0..4], "!!!!");
-            b.commit(r1, 4);
-            try testing.expectEqual(@as(usize, 0), b.totalAvailableForWrite());
-            try testing.expectEqual(@as(usize, 12), b.totalAvailableForRead());
+            r1.commit(4);
 
             const p1 = b.peek();
-            try testing.expectEqualStrings(", World!", p1);
-            b.consume(2);
-            try testing.expectEqual(@as(usize, 2), b.totalAvailableForWrite());
-            try testing.expectEqual(@as(usize, 10), b.totalAvailableForRead());
+            try testing.expectEqualStrings(", World!!", p1.data);
+            p1.consume(2);
 
             const p2 = b.peek();
-            try testing.expectEqualStrings("World!", p2);
+            try testing.expectEqualStrings("World!!", p2.data);
             // This bumps up tail past the mark and wraps it around, so we recover the full buffer for writes past it.
-            b.consume(p2.len);
-            try testing.expectEqual(@as(usize, 12), b.totalAvailableForWrite());
-            try testing.expectEqual(@as(usize, 4), b.totalAvailableForRead());
+            p2.consume(p2.data.len);
 
             const p3 = b.peek();
-            try testing.expectEqualStrings("!!!!", p3);
-            b.consume(p3.len);
-            try testing.expectEqual(@as(usize, 16), b.totalAvailableForWrite());
-            try testing.expectEqual(@as(usize, 0), b.totalAvailableForRead());
+            try testing.expectEqualStrings("!!!!", p3.data);
+            p3.consume(p3.data.len);
 
-            try testing.expectEqual(@as(usize, 13), b.mark);
+            try testing.expectEqual(@as(usize, 14), b.mark);
             try testing.expectEqual(@as(usize, 4), b.head);
             try testing.expectEqual(@as(usize, 4), b.tail);
         }
@@ -264,60 +253,64 @@ test {
 }
 
 test "multithreaded" {
-    if (false) {
-        const testing = std.testing;
+    const testing = std.testing;
 
-        const BB = BipBufferUnmanaged(u8, .{ .single_threaded = false });
+    const iteration_count = 100_000_000;
+    const bb_size = 512;
 
-        const producer = struct {
-            fn producer(bb: *BB, arg_rng_state: std.Random.DefaultPrng, count: usize) !void {
-                var rng_state = arg_rng_state;
-                const rng = rng_state.random();
+    const BB = BipBufferUnmanaged(u8, .{ .single_threaded = false });
 
-                var i: usize = 0;
-                while (i < count) {
-                    const reserve_count = rng.intRangeLessThan(usize, 1, 256);
+    const producer = struct {
+        fn producer(bb: *BB, arg_rng_state: std.Random.DefaultPrng, count: usize) !void {
+            var rng_state = arg_rng_state;
+            const rng = rng_state.random();
 
-                    const reservation = spin: while (true) break :spin bb.reserve(reserve_count) catch continue :spin;
-                    for (reservation.data, 0..) |*out, j| out.* = @truncate(i + j);
+            var i: usize = 0;
+            while (i < count) {
+                const reserve_count = rng.intRangeLessThan(usize, 1, bb_size / 2);
 
-                    const commit_count = rng.intRangeLessThan(usize, 0, reserve_count);
-                    bb.commit(reservation, commit_count);
+                const reservation = spin: while (true) break :spin bb.reserveExact(reserve_count) orelse continue :spin;
+                for (reservation.data, 0..) |*out, j| out.* = @truncate(i + j);
 
-                    i += commit_count;
-                }
+                const commit_count = rng.intRangeLessThan(usize, 0, reserve_count);
+                reservation.commit(commit_count);
+
+                i += commit_count;
             }
-        }.producer;
+        }
+    }.producer;
 
-        const consumer = struct {
-            fn consumer(bb: *BB, arg_rng_state: std.Random.DefaultPrng, count: usize) !void {
-                var rng_state = arg_rng_state;
-                const rng = rng_state.random();
+    const consumer = struct {
+        fn consumer(bb: *BB, arg_rng_state: std.Random.DefaultPrng, count: usize) !void {
+            var rng_state = arg_rng_state;
+            const rng = rng_state.random();
 
-                var i: usize = 0;
-                while (i < count) {
-                    const peeked = spin: while (true) break :spin bb.peek() orelse continue :spin;
+            var i: usize = 0;
+            while (i < count) {
+                const peeked = spin: while (true) {
+                    const p = bb.peek();
+                    if (p.data.len > 0) break :spin p;
+                };
 
-                    const consume_count = rng.intRangeAtMost(usize, 1, peeked.data.len);
-                    for (peeked.data[0..consume_count], 0..) |in, j| try testing.expectEqual(@as(u8, @truncate(i + j)), in);
-                    bb.consume(peeked, consume_count);
+                const consume_count = rng.intRangeAtMost(usize, 1, peeked.data.len);
+                for (peeked.data[0..consume_count], 0..) |in, j| try testing.expectEqual(@as(u8, @truncate(i + j)), in);
+                peeked.consume(consume_count);
 
-                    i += consume_count;
-                }
+                i += consume_count;
             }
-        }.consumer;
+        }
+    }.consumer;
 
-        const storage = try testing.allocator.alloc(u8, 512);
-        defer testing.allocator.free(storage);
+    const storage = try testing.allocator.alloc(u8, bb_size);
+    defer testing.allocator.free(storage);
 
-        const rng_state = std.Random.DefaultPrng.init(0);
+    const rng_state = std.Random.DefaultPrng.init(0);
 
-        var bb = BB.init(storage);
+    var bb = BB.init(storage);
 
-        const t_cons = try std.Thread.spawn(.{}, consumer, .{ &bb, rng_state, 100_000 });
-        defer t_cons.join();
+    const t_cons = try std.Thread.spawn(.{}, consumer, .{ &bb, rng_state, iteration_count });
+    defer t_cons.join();
 
-        const t_prod = try std.Thread.spawn(.{}, producer, .{ &bb, rng_state, 100_000 });
-        defer t_prod.join();
-    }
+    const t_prod = try std.Thread.spawn(.{}, producer, .{ &bb, rng_state, iteration_count });
+    defer t_prod.join();
 }
