@@ -262,3 +262,62 @@ test {
         }
     }
 }
+
+test "multithreaded" {
+    if (false) {
+        const testing = std.testing;
+
+        const BB = BipBufferUnmanaged(u8, .{ .single_threaded = false });
+
+        const producer = struct {
+            fn producer(bb: *BB, arg_rng_state: std.Random.DefaultPrng, count: usize) !void {
+                var rng_state = arg_rng_state;
+                const rng = rng_state.random();
+
+                var i: usize = 0;
+                while (i < count) {
+                    const reserve_count = rng.intRangeLessThan(usize, 1, 256);
+
+                    const reservation = spin: while (true) break :spin bb.reserve(reserve_count) catch continue :spin;
+                    for (reservation.data, 0..) |*out, j| out.* = @truncate(i + j);
+
+                    const commit_count = rng.intRangeLessThan(usize, 0, reserve_count);
+                    bb.commit(reservation, commit_count);
+
+                    i += commit_count;
+                }
+            }
+        }.producer;
+
+        const consumer = struct {
+            fn consumer(bb: *BB, arg_rng_state: std.Random.DefaultPrng, count: usize) !void {
+                var rng_state = arg_rng_state;
+                const rng = rng_state.random();
+
+                var i: usize = 0;
+                while (i < count) {
+                    const peeked = spin: while (true) break :spin bb.peek() orelse continue :spin;
+
+                    const consume_count = rng.intRangeAtMost(usize, 1, peeked.data.len);
+                    for (peeked.data[0..consume_count], 0..) |in, j| try testing.expectEqual(@as(u8, @truncate(i + j)), in);
+                    bb.consume(peeked, consume_count);
+
+                    i += consume_count;
+                }
+            }
+        }.consumer;
+
+        const storage = try testing.allocator.alloc(u8, 512);
+        defer testing.allocator.free(storage);
+
+        const rng_state = std.Random.DefaultPrng.init(0);
+
+        var bb = BB.init(storage);
+
+        const t_cons = try std.Thread.spawn(.{}, consumer, .{ &bb, rng_state, 100_000 });
+        defer t_cons.join();
+
+        const t_prod = try std.Thread.spawn(.{}, producer, .{ &bb, rng_state, 100_000 });
+        defer t_prod.join();
+    }
+}
