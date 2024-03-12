@@ -38,14 +38,17 @@ pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
         }
 
         pub fn reserveLargest(b: *Buffer, count: usize) Reserve {
-            const head = load(&b.head);
+            // We are the writing thread so we can load head unordered.
+            const head = load(&b.head, .unordered);
             check(head < b.data.len, "BUG: inconsistent head pointer value");
 
-            const tail = load(&b.tail);
+            // Load acquire to synchronise with the reading thread.
+            const tail = load(&b.tail, .acquire);
             check(tail < b.data.len, "BUG: inconsistent tail pointer value");
 
             if (head < tail) {
-                const mark = load(&b.mark);
+                // We are the writing thread so we can load mark unordered.
+                const mark = load(&b.mark, .unordered);
                 check(mark <= b.data.len, "BUG: inconsistent mark pointer value");
                 check(head <= mark, "BUG: inconsistent mark and head pointer value");
 
@@ -110,17 +113,18 @@ pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
                 check(next_head < r.__bb.data.len, "BUG: inconsistent head pointer value");
                 check(next_mark <= r.__bb.data.len, "BUG: inconsistent mark pointer value");
                 check(next_head <= next_mark, "BUG: inconsistent mark and head pointer value");
-                store(&r.__bb.mark, next_mark);
-                store(&r.__bb.head, next_head);
+                store(&r.__bb.mark, next_mark, .unordered);
+                store(&r.__bb.head, next_head, .release);
             }
         };
 
         pub fn peek(b: *Buffer) Peek {
-            const head = load(&b.head);
-            check(head < b.data.len, "BUG: inconsistent head pointer value");
-
-            const tail = load(&b.tail);
+            // We are the reading thread so we can load tail unordered.
+            const tail = load(&b.tail, .unordered);
             check(tail < b.data.len, "BUG: inconsistent tail pointer value");
+
+            const head = load(&b.head, .acquire);
+            check(head < b.data.len, "BUG: inconsistent head pointer value");
 
             if (head >= tail) {
                 return .{
@@ -130,7 +134,9 @@ pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
                     .__wrap = false,
                 };
             } else {
-                const mark = load(&b.mark);
+                // Tail is further than head, which means mark cannot be changed until tail wraps around.
+                // This means loading head acquire (which we already did) is correct.
+                const mark = load(&b.mark, .unordered);
                 check(mark <= b.data.len, "BUG: inconsistent mark pointer value");
                 check(head <= mark, "BUG: inconsistent mark and head pointer value");
 
@@ -169,7 +175,7 @@ pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
                     break :blk next;
                 };
                 check(next_tail < p.__bb.data.len, "BUG: inconsistent tail pointer value");
-                store(&p.__bb.tail, next_tail);
+                store(&p.__bb.tail, next_tail, .release);
             }
         };
 
@@ -177,21 +183,21 @@ pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
             if (comptime opts.safety_checks) if (!b) @panic(msg);
         }
 
-        inline fn load(p: *const usize) usize {
+        inline fn load(p: *const usize, ordering: std.builtin.AtomicOrder) usize {
             var v: usize = undefined;
             if (comptime opts.single_threaded) {
                 v = p.*;
             } else {
-                v = @atomicLoad(usize, p, .acquire);
+                v = @atomicLoad(usize, p, ordering);
             }
             return v;
         }
 
-        inline fn store(p: *usize, v: usize) void {
+        inline fn store(p: *usize, v: usize, ordering: std.builtin.AtomicOrder) void {
             if (comptime opts.single_threaded) {
                 p.* = v;
             } else {
-                @atomicStore(usize, p, v, .release);
+                @atomicStore(usize, p, v, ordering);
             }
         }
     };
@@ -304,7 +310,13 @@ test "multithreaded" {
     const storage = try testing.allocator.alloc(u8, bb_size);
     defer testing.allocator.free(storage);
 
-    const rng_state = std.Random.DefaultPrng.init(0);
+    const seed = blk: {
+        var seed: u64 = undefined;
+        try std.os.getrandom(std.mem.asBytes(&seed));
+        break :blk seed;
+    };
+    errdefer std.debug.print("bip seed: {}\n", .{seed});
+    const rng_state = std.Random.DefaultPrng.init(seed);
 
     var bb = BB.init(storage);
 
