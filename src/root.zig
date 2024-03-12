@@ -182,7 +182,7 @@ pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
             if (comptime opts.single_threaded) {
                 v = p.*;
             } else {
-                v = @atomicLoad(usize, p, .Acquire);
+                v = @atomicLoad(usize, p, .acquire);
             }
             return v;
         }
@@ -191,7 +191,7 @@ pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
             if (comptime opts.single_threaded) {
                 p.* = v;
             } else {
-                @atomicStore(usize, p, v, .Release);
+                @atomicStore(usize, p, v, .release);
             }
         }
     };
