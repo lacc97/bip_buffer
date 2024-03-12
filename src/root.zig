@@ -262,7 +262,7 @@ test "multithreaded" {
     const testing = std.testing;
 
     const iteration_count = 100_000_000;
-    const bb_size = 512;
+    const bb_size = 600;
 
     const BB = BipBufferUnmanaged(u8, .{ .single_threaded = false });
 
