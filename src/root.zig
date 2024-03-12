@@ -4,7 +4,7 @@ const assert = std.debug.assert;
 
 pub const Options = struct {
     safety_checks: bool = (builtin.mode == .Debug or builtin.mode == .ReleaseSafe),
-    single_threaded: bool = true,
+    single_threaded: bool = builtin.single_threaded,
 };
 
 pub fn BipBufferUnmanaged(comptime T: type, comptime opts: Options) type {
