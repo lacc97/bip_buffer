@@ -315,8 +315,13 @@ test {
         {
             try testing.expectEqual(@as(?B.Reserve, null), b.reserveExact(16));
             var r0 = b.reserveExact(11) orelse return error.OutOfSpace;
-            @memcpy(r0.data[0..9], ", World!!");
-            r0.commit(9);
+            @memcpy(r0.data[0..9], ", World1!");
+            r0.commit(4);
+
+            // Check that multiple commit works.
+            try testing.expectEqual(@as(u64, 7), r0.data.len);
+            r0.data[3] = '!';
+            r0.commit(5);
 
             // This one will leave a mark at 14 because there is only 3 spaces left at the end of the ring.
             var r1 = b.reserveExact(4) orelse return error.OutOfSpace;
@@ -327,10 +332,14 @@ test {
             try testing.expectEqualStrings(", World!!", p1.data);
             p1.consume(2);
 
+            try testing.expectEqual(@as(?B.Reserve, null), b.reserveExact(3));
+
             var p2 = b.peek();
             try testing.expectEqualStrings("World!!", p2.data);
             // This bumps up tail past the mark and wraps it around, so we recover the full buffer for writes past it.
             p2.consume(p2.data.len);
+
+            try testing.expectEqual(12, b.reserveExact(12).?.data.len);
 
             var p3 = b.peek();
             try testing.expectEqualStrings("!!!!", p3.data);
