@@ -15,7 +15,7 @@ fn BipBufferCore(comptime opts: Options) type {
         head: usize = 0,
         tail: usize = 0,
 
-        fn reserveLargest(b: *BufferCore, count: usize, buffer_len: usize) Reserve {
+        fn reserveAtLeast(b: *BufferCore, count: usize, buffer_len: usize) Reserve {
             // We are the writing thread so we can load head unordered.
             const head = load(&b.head, .unordered);
             check(head < buffer_len, "BUG: inconsistent head pointer value");
@@ -30,7 +30,10 @@ fn BipBufferCore(comptime opts: Options) type {
                 check(mark <= buffer_len, "BUG: inconsistent mark pointer value");
                 check(head <= mark, "BUG: inconsistent mark and head pointer value");
 
-                const len = @min(count, tail - head - 1);
+                const len = blk: {
+                    const avail = tail - head - 1;
+                    break :blk if (avail >= count) avail else 0;
+                };
                 return .{
                     .beg = head,
                     .len = len,
@@ -46,7 +49,7 @@ fn BipBufferCore(comptime opts: Options) type {
                 if ((end - head) >= count) {
                     return .{
                         .beg = head,
-                        .len = count,
+                        .len = (end - head),
                         .core = .{
                             .bc = b,
                             .head = head,
@@ -56,7 +59,10 @@ fn BipBufferCore(comptime opts: Options) type {
                     };
                 } else {
                     // Wrap around.
-                    const len = if (tail > 0) @min(count, tail - 1) else 0;
+                    const len = blk: {
+                        const avail = if (tail > 0) tail - 1 else 0;
+                        break :blk if (avail >= count) avail else 0;
+                    };
                     return .{
                         .beg = 0,
                         .len = len,
@@ -243,13 +249,8 @@ pub fn BipBuffer(comptime T: type, comptime opts: Options) type {
             b.core = .{};
         }
 
-        pub fn reserveExact(b: *Buffer, count: usize) ?Reserve {
-            const r = b.reserveLargest(count);
-            return if (r.data.len == count) r else null;
-        }
-
-        pub fn reserveLargest(b: *Buffer, count: usize) Reserve {
-            const r = b.core.reserveLargest(count, b.data.len);
+        pub fn reserveAtLeast(b: *Buffer, count: usize) Reserve {
+            const r = b.core.reserveAtLeast(count, b.data.len);
             return .{ .data = b.data[r.beg..][0..r.len], .__core = r.core };
         }
 
@@ -303,7 +304,7 @@ test {
         var b = B.init(storage);
 
         {
-            var r = b.reserveExact(16) orelse return error.OutOfSpace;
+            var r = b.reserveAtLeast(16);
             @memcpy(r.data[0..5], "Hello");
             r.commit(5);
 
@@ -313,18 +314,19 @@ test {
         }
 
         {
-            try testing.expectEqual(@as(?B.Reserve, null), b.reserveExact(16));
-            var r0 = b.reserveExact(11) orelse return error.OutOfSpace;
+            try testing.expectEqual(@as(usize, 0), b.reserveAtLeast(16).data.len);
+            var r0 = b.reserveAtLeast(11);
+            try testing.expectEqual(@as(usize, 12), r0.data.len);
             @memcpy(r0.data[0..9], ", World1!");
             r0.commit(4);
 
             // Check that multiple commit works.
-            try testing.expectEqual(@as(u64, 7), r0.data.len);
+            try testing.expectEqual(@as(u64, 8), r0.data.len);
             r0.data[3] = '!';
             r0.commit(5);
 
             // This one will leave a mark at 14 because there is only 3 spaces left at the end of the ring.
-            var r1 = b.reserveExact(4) orelse return error.OutOfSpace;
+            var r1 = b.reserveAtLeast(4);
             @memcpy(r1.data[0..4], "!!!!");
             r1.commit(4);
 
@@ -332,14 +334,14 @@ test {
             try testing.expectEqualStrings(", World!!", p1.data);
             p1.consume(2);
 
-            try testing.expectEqual(@as(?B.Reserve, null), b.reserveExact(3));
+            try testing.expectEqual(@as(usize, 2), b.reserveAtLeast(2).data.len);
 
             var p2 = b.peek();
             try testing.expectEqualStrings("World!!", p2.data);
             // This bumps up tail past the mark and wraps it around, so we recover the full buffer for writes past it.
             p2.consume(p2.data.len);
 
-            try testing.expectEqual(12, b.reserveExact(12).?.data.len);
+            try testing.expectEqual(12, b.reserveAtLeast(12).data.len);
 
             var p3 = b.peek();
             try testing.expectEqualStrings("!!!!", p3.data);
@@ -369,7 +371,10 @@ test "multithreaded" {
             while (i < count) {
                 const reserve_count = rng.intRangeLessThan(usize, 1, bb_size / 2);
 
-                var reservation = spin: while (true) break :spin bb.reserveExact(reserve_count) orelse continue :spin;
+                var reservation = spin: while (true) {
+                    const r = bb.reserveAtLeast(reserve_count);
+                    if (r.data.len > 0) break :spin r;
+                };
                 for (reservation.data, 0..) |*out, j| out.* = @truncate(i + j);
 
                 const commit_count = rng.intRangeLessThan(usize, 0, reserve_count);
