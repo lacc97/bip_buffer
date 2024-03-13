@@ -7,6 +7,65 @@ pub const Options = struct {
     single_threaded: bool = builtin.single_threaded,
 };
 
+pub fn BipBuffer(comptime T: type, comptime opts: Options) type {
+    return struct {
+        const Buffer = @This();
+
+        data: []T,
+        core: Core = .{},
+
+        const Core = BipBufferCore(opts);
+
+        pub fn init(buf: []T) Buffer {
+            if (!(buf.len > 0)) @panic("empty buffer");
+
+            return .{ .data = buf };
+        }
+
+        pub fn reset(b: *Buffer) void {
+            b.core = .{};
+        }
+
+        pub fn reserveAtLeast(b: *Buffer, count: usize) Reserve {
+            const r = b.core.reserveAtLeast(count, b.data.len);
+            return .{ .data = b.data[r.beg..][0..r.len], .__core = r.core };
+        }
+
+        pub const Reserve = struct {
+            data: []T,
+            __core: Core.ReserveCore,
+
+            pub fn commit(r: *Reserve, count: usize) void {
+                r.__core.commit(
+                    count,
+                    @fieldParentPtr(Buffer, "core", r.__core.bc).data.len,
+                    r.data.len,
+                );
+                r.data = r.data[count..];
+            }
+        };
+
+        pub fn peek(b: *Buffer) Peek {
+            const p = b.core.peek(b.data.len);
+            return .{ .data = b.data[p.beg..][0..p.len], .__core = p.core };
+        }
+
+        pub const Peek = struct {
+            data: []T,
+            __core: Core.PeekCore,
+
+            pub fn consume(p: *Peek, count: usize) void {
+                p.__core.consume(
+                    count,
+                    @fieldParentPtr(Buffer, "core", p.__core.bc).data.len,
+                    p.data.len,
+                );
+                p.data = p.data[count..];
+            }
+        };
+    };
+}
+
 fn BipBufferCore(comptime opts: Options) type {
     return struct {
         const BufferCore = @This();
@@ -227,65 +286,6 @@ fn BipBufferCore(comptime opts: Options) type {
                 @atomicStore(usize, p, v, ordering);
             }
         }
-    };
-}
-
-pub fn BipBuffer(comptime T: type, comptime opts: Options) type {
-    return struct {
-        const Buffer = @This();
-
-        data: []T,
-        core: Core = .{},
-
-        const Core = BipBufferCore(opts);
-
-        pub fn init(buf: []T) Buffer {
-            if (!(buf.len > 0)) @panic("empty buffer");
-
-            return .{ .data = buf };
-        }
-
-        pub fn reset(b: *Buffer) void {
-            b.core = .{};
-        }
-
-        pub fn reserveAtLeast(b: *Buffer, count: usize) Reserve {
-            const r = b.core.reserveAtLeast(count, b.data.len);
-            return .{ .data = b.data[r.beg..][0..r.len], .__core = r.core };
-        }
-
-        pub const Reserve = struct {
-            data: []T,
-            __core: Core.ReserveCore,
-
-            pub fn commit(r: *Reserve, count: usize) void {
-                r.__core.commit(
-                    count,
-                    @fieldParentPtr(Buffer, "core", r.__core.bc).data.len,
-                    r.data.len,
-                );
-                r.data = r.data[count..];
-            }
-        };
-
-        pub fn peek(b: *Buffer) Peek {
-            const p = b.core.peek(b.data.len);
-            return .{ .data = b.data[p.beg..][0..p.len], .__core = p.core };
-        }
-
-        pub const Peek = struct {
-            data: []T,
-            __core: Core.PeekCore,
-
-            pub fn consume(p: *Peek, count: usize) void {
-                p.__core.consume(
-                    count,
-                    @fieldParentPtr(Buffer, "core", p.__core.bc).data.len,
-                    p.data.len,
-                );
-                p.data = p.data[count..];
-            }
-        };
     };
 }
 
